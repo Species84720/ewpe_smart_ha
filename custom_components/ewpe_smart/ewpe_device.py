@@ -14,84 +14,64 @@ from .const import (
     DEFAULT_PORT,
     GENERIC_KEY,
     SOCKET_TIMEOUT,
+    ALL_PARAMS,
+    PARAM_PM25_A,
+    PARAM_PM25_B,
     PARAM_POWER,
     PARAM_FAN_SPEED,
     PARAM_MODE,
-    PARAM_PM25,
-    PARAM_FILTER_LIFE,
-    PARAM_AIR_QUALITY,
-    PARAM_CHILD_LOCK,
-    PARAM_SLEEP,
-    PARAM_LIGHT,
+    POWER_ON,
+    POWER_OFF,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-PACK_TYPE_GENERIC = "pack"
-CMD_SCAN = "scan"
-CMD_BIND = "bind"
-CMD_GET = "status"
-CMD_SET = "cmd"
-
 
 class EWPEDeviceError(Exception):
-    """Raised when a device communication error occurs."""
+    """Raised when device communication fails."""
 
+
+# ── AES helpers ──────────────────────────────────────────────────────────────
 
 def _pad(s: str) -> str:
-    """Pad string to AES block size."""
-    block_size = 16
-    return s + (block_size - len(s) % block_size) * chr(block_size - len(s) % block_size)
+    n = 16 - len(s) % 16
+    return s + chr(n) * n
 
 
-def _unpad(s: bytes) -> bytes:
-    """Remove padding from decrypted bytes."""
-    return s[: -s[-1]]
+def _unpad(b: bytes) -> bytes:
+    return b[: -b[-1]]
 
 
 def _encrypt(plaintext: str, key: str) -> str:
-    """Encrypt plaintext using AES-128 ECB."""
-    cipher = AES.new(key.encode("utf-8"), AES.MODE_ECB)
-    encrypted = cipher.encrypt(_pad(plaintext).encode("utf-8"))
-    return base64.b64encode(encrypted).decode("utf-8")
+    cipher = AES.new(key.encode(), AES.MODE_ECB)
+    return base64.b64encode(cipher.encrypt(_pad(plaintext).encode())).decode()
 
 
 def _decrypt(ciphertext: str, key: str) -> dict:
-    """Decrypt base64 ciphertext using AES-128 ECB and return parsed JSON."""
-    cipher = AES.new(key.encode("utf-8"), AES.MODE_ECB)
-    decrypted = _unpad(cipher.decrypt(base64.b64decode(ciphertext)))
-    return json.loads(decrypted.decode("utf-8"))
+    cipher = AES.new(key.encode(), AES.MODE_ECB)
+    raw = _unpad(cipher.decrypt(base64.b64decode(ciphertext)))
+    return json.loads(raw.decode())
 
 
-def _create_request(tcid: str, pack_type: str, pack: dict, i: int = 0) -> bytes:
-    """Build a UDP request packet."""
+# ── Packet builders ──────────────────────────────────────────────────────────
+
+def _pack_request(tcid: str, pack: dict, key: str, i: int = 0) -> bytes:
     msg = {
-        "cid": "app",
-        "i": i,
-        "t": pack_type,
-        "uid": 0,
-        "tcid": tcid,
-        "pack": pack,
+        "cid": "app", "i": i, "t": "pack",
+        "uid": 0, "tcid": tcid,
+        "pack": _encrypt(json.dumps(pack), key),
     }
-    return json.dumps(msg).encode("utf-8")
+    return json.dumps(msg).encode()
 
 
-def _create_encrypted_request(tcid: str, pack: dict, key: str, i: int = 0) -> bytes:
-    """Build an encrypted UDP request packet."""
-    encrypted_pack = _encrypt(json.dumps(pack), key)
-    msg = {
-        "cid": "app",
-        "i": i,
-        "t": PACK_TYPE_GENERIC,
-        "uid": 0,
-        "tcid": tcid,
-        "pack": encrypted_pack,
-    }
-    return json.dumps(msg).encode("utf-8")
+def _scan_request() -> bytes:
+    return json.dumps({"cid": "app", "i": 0, "t": "scan", "uid": 0, "tcid": ""}).encode()
 
+
+# ── Device class ─────────────────────────────────────────────────────────────
 
 class EWPEDevice:
-    """Represents an EWPE Smart compatible device (Ergo Air Purifier)."""
+    """Communicates with an EWPE Smart device over UDP."""
 
     def __init__(
         self,
@@ -101,161 +81,132 @@ class EWPEDevice:
         port: int = DEFAULT_PORT,
         device_key: str | None = None,
     ) -> None:
-        """Initialise the device."""
         self.host = host
         self.mac = mac
         self.name = name
         self.port = port
-        self.device_key = device_key or GENERIC_KEY
+        self.device_key: str = device_key or GENERIC_KEY
         self._properties: dict[str, Any] = {}
+        # Track which PM25 key the device actually uses
+        self._pm25_key: str | None = None
 
     @property
     def properties(self) -> dict[str, Any]:
-        """Return the last fetched device properties."""
         return self._properties
 
-    def _send_udp(self, payload: bytes, timeout: float = SOCKET_TIMEOUT) -> dict:
-        """Send a UDP packet and return the parsed JSON response."""
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(timeout)
-            sock.sendto(payload, (self.host, self.port))
-            data, _ = sock.recvfrom(65535)
-        return json.loads(data.decode("utf-8"))
+    # ── Low-level UDP ────────────────────────────────────────────────────────
 
-    async def _async_send_udp(self, payload: bytes) -> dict:
-        """Send UDP packet asynchronously."""
+    def _send_udp(self, payload: bytes) -> dict:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(SOCKET_TIMEOUT)
+            s.sendto(payload, (self.host, self.port))
+            data, _ = s.recvfrom(65535)
+        return json.loads(data.decode())
+
+    async def _async_send(self, payload: bytes) -> dict:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._send_udp, payload)
 
+    def _decrypt_response(self, response: dict) -> dict:
+        return _decrypt(response["pack"], self.device_key)
+
+    # ── Bind ─────────────────────────────────────────────────────────────────
+
     async def async_bind(self) -> str:
-        """Perform the bind handshake to get the device-specific key."""
-        pack = {"mac": self.mac, "t": CMD_BIND, "uid": 0}
-        request = _create_encrypted_request(self.mac, pack, GENERIC_KEY, i=1)
+        """Perform bind handshake; returns device-specific encryption key."""
+        pack = {"mac": self.mac, "t": "bind", "uid": 0}
+        req = _pack_request(self.mac, pack, GENERIC_KEY, i=1)
         try:
-            response = await self._async_send_udp(request)
-        except (OSError, socket.timeout) as exc:
+            resp = await self._async_send(req)
+            data = _decrypt(resp["pack"], GENERIC_KEY)
+        except Exception as exc:
             raise EWPEDeviceError(f"Bind failed for {self.host}: {exc}") from exc
 
-        pack_data = response.get("pack", "")
-        try:
-            decrypted = _decrypt(pack_data, GENERIC_KEY)
-        except Exception as exc:  # noqa: BLE001
-            raise EWPEDeviceError(f"Failed to decrypt bind response: {exc}") from exc
-
-        key = decrypted.get("key")
+        key = data.get("key")
         if not key:
-            raise EWPEDeviceError("Bind response did not contain a key")
-
+            raise EWPEDeviceError("Bind response missing key")
         self.device_key = key
-        _LOGGER.debug("Bound to %s, key=%s", self.host, key)
+        _LOGGER.debug("Bound %s → key=%s", self.host, key)
         return key
 
+    # ── Poll ─────────────────────────────────────────────────────────────────
+
     async def async_get_properties(self, params: list[str] | None = None) -> dict[str, Any]:
-        """Fetch the current property values from the device."""
-        if params is None:
-            params = [
-                PARAM_POWER,
-                PARAM_FAN_SPEED,
-                PARAM_MODE,
-                PARAM_PM25,
-                PARAM_FILTER_LIFE,
-                PARAM_AIR_QUALITY,
-                PARAM_CHILD_LOCK,
-                PARAM_SLEEP,
-                PARAM_LIGHT,
-            ]
-
-        pack = {"mac": self.mac, "t": CMD_GET, "cols": params}
-        request = _create_encrypted_request(self.mac, pack, self.device_key)
-
+        """Fetch current property values; auto-detects PM2.5 parameter key."""
+        cols = params if params is not None else ALL_PARAMS
+        pack = {"mac": self.mac, "t": "status", "cols": cols}
+        req = _pack_request(self.mac, pack, self.device_key)
         try:
-            response = await self._async_send_udp(request)
-        except (OSError, socket.timeout) as exc:
+            resp = await self._async_send(req)
+            data = self._decrypt_response(resp)
+        except Exception as exc:
             raise EWPEDeviceError(f"Get properties failed for {self.host}: {exc}") from exc
 
-        pack_data = response.get("pack", "")
+        result: dict[str, Any] = dict(zip(data.get("cols", []), data.get("dat", [])))
+
+        # Normalise PM2.5: whichever key has a non-None value wins;
+        # expose it as the canonical PARAM_PM25_A so sensors always find it.
+        if self._pm25_key is None:
+            for k in (PARAM_PM25_A, PARAM_PM25_B):
+                if result.get(k) is not None:
+                    self._pm25_key = k
+                    break
+
+        if self._pm25_key and self._pm25_key != PARAM_PM25_A:
+            result[PARAM_PM25_A] = result.pop(self._pm25_key, None)
+
+        self._properties = result
+        _LOGGER.debug("Properties %s: %s", self.host, result)
+        return result
+
+    # ── Command ──────────────────────────────────────────────────────────────
+
+    async def async_set_properties(self, props: dict[str, Any]) -> bool:
+        """Set one or more parameters on the device."""
+        pack = {"opt": list(props.keys()), "p": list(props.values()), "t": "cmd"}
+        req = _pack_request(self.mac, pack, self.device_key)
         try:
-            decrypted = _decrypt(pack_data, self.device_key)
-        except Exception as exc:  # noqa: BLE001
-            raise EWPEDeviceError(f"Failed to decrypt status response: {exc}") from exc
-
-        cols = decrypted.get("cols", [])
-        dat = decrypted.get("dat", [])
-        self._properties = dict(zip(cols, dat))
-        _LOGGER.debug("Properties for %s: %s", self.host, self._properties)
-        return self._properties
-
-    async def async_set_properties(self, properties: dict[str, Any]) -> bool:
-        """Set one or more property values on the device."""
-        opt = list(properties.keys())
-        p = list(properties.values())
-
-        pack = {"opt": opt, "p": p, "t": CMD_SET}
-        request = _create_encrypted_request(self.mac, pack, self.device_key)
-
-        try:
-            response = await self._async_send_udp(request)
-        except (OSError, socket.timeout) as exc:
+            resp = await self._async_send(req)
+            data = self._decrypt_response(resp)
+        except Exception as exc:
             raise EWPEDeviceError(f"Set properties failed for {self.host}: {exc}") from exc
 
-        pack_data = response.get("pack", "")
-        try:
-            decrypted = _decrypt(pack_data, self.device_key)
-        except Exception as exc:  # noqa: BLE001
-            raise EWPEDeviceError(f"Failed to decrypt set response: {exc}") from exc
+        ok = data.get("r", -1) == 200
+        if ok:
+            self._properties.update(props)
+        return ok
 
-        result = decrypted.get("r", -1)
-        success = result == 200
-        if success:
-            # Optimistically update local state
-            self._properties.update(properties)
-        return success
+    # ── Convenience wrappers ─────────────────────────────────────────────────
 
-    # ---- Convenience helpers ------------------------------------------------
+    async def async_turn_on(self)  -> bool: return await self.async_set_properties({PARAM_POWER: POWER_ON})
+    async def async_turn_off(self) -> bool: return await self.async_set_properties({PARAM_POWER: POWER_OFF})
+    async def async_set_fan_speed(self, speed: int) -> bool: return await self.async_set_properties({PARAM_FAN_SPEED: speed})
+    async def async_set_mode(self, mode: int)       -> bool: return await self.async_set_properties({PARAM_MODE: mode})
 
-    async def async_turn_on(self) -> bool:
-        """Turn the device on."""
-        return await self.async_set_properties({PARAM_POWER: 1})
-
-    async def async_turn_off(self) -> bool:
-        """Turn the device off."""
-        return await self.async_set_properties({PARAM_POWER: 0})
-
-    async def async_set_fan_speed(self, speed: int) -> bool:
-        """Set fan speed (0=Auto, 1=Low, 2=Medium, 3=High)."""
-        return await self.async_set_properties({PARAM_FAN_SPEED: speed})
-
-    async def async_set_mode(self, mode: int) -> bool:
-        """Set operating mode (0=Auto, 1=Manual, 2=Sleep)."""
-        return await self.async_set_properties({PARAM_MODE: mode})
-
-    # ---- Static helpers for discovery ---------------------------------------
+    # ── Discovery ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def scan_network(broadcast: str = "255.255.255.255", port: int = DEFAULT_PORT, timeout: float = 5.0) -> list[dict]:
-        """Broadcast a scan packet and collect device responses."""
-        scan_pack = {"t": CMD_SCAN}
-        request = _create_request("", CMD_SCAN, scan_pack)
-
+    def scan_network(
+        broadcast: str = "255.255.255.255",
+        port: int = DEFAULT_PORT,
+        timeout: float = 5.0,
+    ) -> list[dict]:
+        """Broadcast a scan and collect device responses."""
         found: list[dict] = []
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.settimeout(timeout)
-            sock.sendto(request, (broadcast, port))
-
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.settimeout(timeout)
+            s.sendto(_scan_request(), (broadcast, port))
             try:
                 while True:
-                    data, addr = sock.recvfrom(65535)
+                    data, addr = s.recvfrom(65535)
                     try:
-                        resp = json.loads(data.decode("utf-8"))
-                        pack_data = resp.get("pack", "")
-                        device_info = _decrypt(pack_data, GENERIC_KEY)
-                        device_info["ip"] = addr[0]
-                        found.append(device_info)
-                        _LOGGER.debug("Discovered device: %s", device_info)
-                    except Exception:  # noqa: BLE001
+                        resp = json.loads(data.decode())
+                        info = _decrypt(resp.get("pack", ""), GENERIC_KEY)
+                        info["ip"] = addr[0]
+                        found.append(info)
+                    except Exception:
                         pass
             except socket.timeout:
                 pass
-
         return found
