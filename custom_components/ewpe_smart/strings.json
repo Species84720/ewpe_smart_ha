@@ -1,0 +1,40 @@
+{
+  "title": "EWPE Smart (Ergo Air Purifier)",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect your Ergo Air Purifier",
+        "description": "Enter the IP address of your EWPE Smart device. Make sure it is connected to your local Wi-Fi network via the EWPE Smart app first.",
+        "data": {
+          "host": "IP Address",
+          "port": "Port (default: 7000)",
+          "name": "Device name"
+        }
+      },
+      "select_device": {
+        "title": "Discovered devices",
+        "description": "Select a discovered EWPE Smart device or enter the IP address manually.",
+        "data": {
+          "device": "Device"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the device. Please check the IP address and ensure the device is online.",
+      "unknown": "An unexpected error occurred. Please check the logs for details."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EWPE Smart options",
+        "data": {
+          "update_interval": "Update interval (seconds)"
+        }
+      }
+    }
+  }
+}

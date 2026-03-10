@@ -1,0 +1,8 @@
+{
+  "name": "EWPE Smart (Ergo Air Purifier)",
+  "content_in_root": false,
+  "render_readme": true,
+  "filename": "ewpe_smart.zip",
+  "domains": ["fan", "sensor"],
+  "iot_class": "local_polling"
+}

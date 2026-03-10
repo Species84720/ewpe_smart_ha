@@ -1,0 +1,13 @@
+{
+  "domain": "ewpe_smart",
+  "name": "EWPE Smart (Ergo Air Purifier)",
+  "version": "1.0.0",
+  "config_flow": true,
+  "documentation": "https://github.com/yourusername/ewpe-smart-ha",
+  "issue_tracker": "https://github.com/yourusername/ewpe-smart-ha/issues",
+  "dependencies": [],
+  "codeowners": ["@yourusername"],
+  "requirements": ["pycryptodome>=3.15.0"],
+  "iot_class": "local_polling",
+  "homeassistant": "2023.1.0"
+}
